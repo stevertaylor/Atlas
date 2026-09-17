@@ -586,3 +586,164 @@ def test_fixture_provenance_recorded(fixture, ecorr):
     from .fixtures.pulsar import load_fixture
     _, prov = load_fixture(H.DATA_DIR / f"{fixture}.npz")
     assert prov.get("source") and prov.get("atlas_sha")
+
+
+# --------------------------------------------------------------------------- #
+#  9. Deterministic (continuous-wave) blocks
+# --------------------------------------------------------------------------- #
+
+# The two timing treatments a 'det' block has to work under. Sampled linear
+# timing is the one that used to fail outright.
+DET_MODELS = [
+    pytest.param("ltm|unc+cor->unc;det", True, False, id="ltm"),
+    pytest.param("unc+cor->unc;det", False, True, id="marg"),
+]
+
+
+@pytest.mark.parametrize("model_string,ltm,marg", DET_MODELS)
+def test_det_widths_are_separated_from_nmodes(model_string, ltm, marg):
+    """`nmodes` counts the deterministic columns; the width of the block `z`
+    whitens does not.  Conflating the two is what made `ltm|...;det` raise a
+    raw broadcast error before any likelihood was evaluated."""
+    m = H.build(model_string=model_string, linear_timing=ltm, marg_timing=marg,
+                n_det=6, orf_name="zero")
+    assert m.rn.nmodes_det == 2 * 6
+    assert m.rn.nmodes_reparam == m.rn.nmodes - m.rn.nmodes_det
+    assert m.rn.nmodes_reparam == m.n_tm + 2 * m.n_irn
+    assert m.rn.nmodes_marg == 2 * m.n_gwb
+    # the deterministic columns are not red-noise frequency bins
+    assert m.rn.nfreqs == m.n_irn
+
+
+@pytest.mark.parametrize("model_string,ltm,marg", DET_MODELS)
+def test_det_block_equals_subtracting_the_waveform(model_string, ltm, marg):
+    """A deterministic block must be exactly equivalent to subtracting the same
+    waveform from the data and evaluating the stochastic model alone:
+
+        lnpost(r, D_params)  ==  lnpost_no_det(r - F_det a_det)
+
+    which pins the sign and placement of every cross term (`RD`, `Dr`, `DD`)
+    together with the `rNr` bookkeeping, for both timing treatments.
+    """
+    m = H.build(model_string=model_string, linear_timing=ltm, marg_timing=marg,
+                n_det=6, orf_name="hd")
+    D = H.cw_point(m.npsr)
+    r_sub = np.asarray(jnp.concat(m.data.raw_residuals)
+                       - m.rn.det_signal.get_det_residuals(*D))
+    m0 = H.build(model_string=model_string.replace(";det", ""), linear_timing=ltm,
+                 marg_timing=marg, orf_name="hd")
+    h0 = H.helpers_for(m0, r_sub)
+    assert m0.rn.nmodes == m.rn.nmodes_reparam
+
+    red = m.red_params()
+    z = jnp.asarray(np.random.default_rng(31).normal(size=(m.npsr, m.rn.nmodes_reparam)))
+    lp, coeff = m.rn.lnposterior_reparam(m.helpers, red, z, D_params=D)
+    lp0, coeff0 = m0.rn.lnposterior_reparam(h0, red, z)
+    assert abs(float(lp) - float(lp0)) / abs(float(lp0)) < LOOSE
+    c, c0 = np.asarray(coeff), np.asarray(coeff0)
+    assert np.max(np.abs(c - c0)) / np.max(np.abs(c0)) < LOOSE
+
+    zp = jnp.asarray(np.random.default_rng(32).normal(size=(m.npsr, m.rn.nmodes_marg)))
+    pm, _ = m.rn.partial_marg_lnposterior(m.helpers, red, zp, D_params=D)
+    pm0, _ = m0.rn.partial_marg_lnposterior(h0, red, zp)
+    assert abs(float(pm) - float(pm0)) / abs(float(pm0)) < LOOSE
+
+
+def test_det_params_carry_a_correct_gradient():
+    """The deterministic parameters are sampled by NUTS through this density,
+    so their gradient is the product, not a by-product."""
+    m = H.build(model_string="unc+cor->unc;det", linear_timing=False,
+                marg_timing=True, n_det=6, orf_name="hd")
+    cw, phases, dists = H.cw_point(m.npsr)
+    red = m.red_params()
+    z = jnp.zeros((m.npsr, m.rn.nmodes_reparam))
+
+    def f(c):
+        return m.rn.lnposterior_reparam(m.helpers, red, z,
+                                        D_params=(c, phases, dists))[0]
+
+    g = np.asarray(jax.grad(f)(cw))
+    assert np.all(np.isfinite(g)) and np.any(np.abs(g) > 1e-3)
+    # Looser than GRAD_TOL by construction, and the looseness is the finite
+    # difference's, not the gradient's: the density is ~5e3 while the chirp-mass
+    # and sky directions are nearly flat (|d lnpost| ~ 1e-2), so central
+    # differences there sit on their own noise floor. Measured worst case at
+    # eps=1e-4 is 7.5e-6 absolute on a gradient of 1.6e-2; the tolerance below
+    # clears it by ~3x, and every FD converges to the analytic value as eps
+    # shrinks until roundoff takes over.
+    eps = 1e-4
+    for i in range(cw.size):
+        step = jnp.zeros_like(cw).at[i].set(eps)
+        fd = (float(f(cw + step)) - float(f(cw - step))) / (2 * eps)
+        assert abs(fd - g[i]) <= 1e-5 + 1e-3 * abs(g[i]), \
+            f"cw param {i}: grad {g[i]} vs fd {fd}"
+
+
+def _det_model():
+    return H.build(model_string="unc+cor->unc;det", linear_timing=False,
+                   marg_timing=True, n_det=4, orf_name="zero")
+
+
+def test_det_block_requires_D_params():
+    m = _det_model()
+    with pytest.raises(ValueError, match="D_params"):
+        m.rn.lnposterior_reparam(m.helpers, m.red_params(),
+                                 jnp.zeros((m.npsr, m.rn.nmodes_reparam)))
+
+
+def test_D_params_without_a_det_block_is_rejected():
+    m = H.build(orf_name="zero")
+    with pytest.raises(ValueError, match="no 'det' block"):
+        m.rn.lnposterior_reparam(m.helpers, m.red_params(),
+                                 jnp.zeros((m.npsr, m.rn.nmodes_reparam)),
+                                 D_params=H.cw_point(m.npsr))
+
+
+def test_z_sized_by_nmodes_is_rejected_and_names_the_fix():
+    """`jnp.zeros((npsr, rn.nmodes))` is the idiom used everywhere else in the
+    repo; with a deterministic block it is too wide, and the error has to say
+    which attribute to use instead."""
+    m = _det_model()
+    with pytest.raises(ValueError, match="nmodes_reparam"):
+        m.rn.lnposterior_reparam(m.helpers, m.red_params(),
+                                 jnp.zeros((m.npsr, m.rn.nmodes)),
+                                 D_params=H.cw_point(m.npsr))
+
+
+def test_curn_rejects_a_det_block():
+    """`ln_likelihood_curn` marginalises every column under the red-noise prior
+    and has no deterministic term, so it must refuse rather than answer."""
+    m = _det_model()
+    with pytest.raises(ValueError, match="ln_likelihood_curn"):
+        m.rn.ln_likelihood_curn(m.helpers, m.red_params())
+
+
+def test_det_cannot_share_a_basis():
+    with pytest.raises(ValueError, match="cannot share a basis"):
+        H.build(model_string="unc+det->unc", linear_timing=False,
+                marg_timing=True, n_det=4, orf_name="zero")
+
+
+def test_model_maker_rejects_a_det_block():
+    """The packaged NumPyro model drives the stochastic sites only."""
+    from ATLAS.model import model_maker
+    m = _det_model()
+    with pytest.raises(ValueError, match="does not sample deterministic"):
+        model_maker(raw_residuals=None, super_sig=m.rn, marg_over_non_gwb=False,
+                    helpers=m.helpers)
+
+
+def test_det_block_without_bins_is_rejected():
+    """`num_det_bins` unset reaches the constructor as `2 * None`."""
+    with pytest.raises(ValueError, match="num_det_bins"):
+        H.build(model_string="unc+cor->unc;det", linear_timing=False,
+                marg_timing=True, n_det=0, orf_name="zero")
+
+
+def test_det_block_without_a_waveform_is_rejected():
+    """A missing delay function otherwise surfaces only when the likelihood
+    first calls it, several layers of `jit` down."""
+    from ATLAS.model_builder import ModelBuilder
+    m = _det_model()
+    with pytest.raises(ValueError, match="det_delay_function"):
+        ModelBuilder(data=m.data).make_red_noise("det")

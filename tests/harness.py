@@ -28,6 +28,7 @@ from ATLAS.data import PTA_Data
 from ATLAS.model_builder import ModelBuilder
 from ATLAS.nMatrix.base import WhiteCov
 from ATLAS.psd_functions import powerlaw, hd_orf
+from ATLAS.signals.deterministic.det_signals import cw_delay_evolve_float64
 
 # One white-noise point, used everywhere so the reference and ATLAS agree by
 # construction on the parameters rather than by accident.
@@ -38,6 +39,21 @@ TOAS_PER_SESSION = 3
 
 ZERO_ORF = lambda angle: jnp.zeros_like(jnp.asarray(angle))
 ORFS = {"hd": hd_orf, "zero": ZERO_ORF}
+
+# One continuous-wave source, for the deterministic-block tests. Order is the
+# one `cw_delay_evolve_float64` unpacks: log10 chirp mass, log10 f_gw, cos i,
+# psi, log10 h, cos theta, phi, phase0.
+CW_BOUNDS = np.array([[7.2, -8.7, -1.0, 0.0, -18.0, -1.0, 0.0, 0.0],
+                      [9.0, -8.2, 1.0, np.pi, -12.0, 1.0, 2 * np.pi, 2 * np.pi]]).T
+CW_PARAMS = jnp.array([8.5, -8.4, 0.3, 1.0, -13.5, 0.2, 2.0, 1.0])
+
+
+def cw_point(npsr, log10_h=None):
+    """(det_params, psr_phases, psr_dists) for `D_params`."""
+    params = CW_PARAMS if log10_h is None else CW_PARAMS.at[4].set(log10_h)
+    return (params,
+            jnp.linspace(0.1, 6.0, npsr),
+            jnp.linspace(0.8, 1.5, npsr))
 
 
 @dataclass
@@ -57,6 +73,7 @@ class Model:
     n_gtm: int = 0
     adaptus_basis: object = None
     gtm_psd: object = None
+    n_det: int = 0
 
     @property
     def npsr(self):
@@ -120,13 +137,13 @@ def white_noise_vector(psrs, include_ecorr=True):
 @lru_cache(maxsize=32)
 def build(npsr=2, model_string="ltm|unc+cor->unc", linear_timing=True,
           marg_timing=False, orf_name="hd", n_gwb=4, n_irn=6, include_ecorr=True,
-          fixture="synth", n_dm=0, n_gtm=0):
+          fixture="synth", n_dm=0, n_gtm=0, n_det=0):
     psrs = load_psrs(fixture, npsr)
     npsr = len(psrs)
     adaptus_basis, gtm_psd = (make_adaptus_basis(psrs, n_gtm) if n_gtm else (None, None))
     data = PTA_Data(
         psrs, num_gwb_bins=n_gwb, num_irn_bins=n_irn,
-        num_dm_bins=(n_dm or None),
+        num_dm_bins=(n_dm or None), num_det_bins=(n_det or None),
         adaptus_basis=adaptus_basis, adaptus_size=(n_gtm or None),
         fixed_white_noise_params=None,
         linear_timing=linear_timing, marg_timing=marg_timing,
@@ -139,6 +156,8 @@ def build(npsr=2, model_string="ltm|unc+cor->unc", linear_timing=True,
         irn_psd_function=powerlaw, gwb_psd_function=powerlaw,
         orf_function=ORFS[orf_name],
         dm_psd_function=(powerlaw if n_dm else None),
+        det_delay_function=(cw_delay_evolve_float64 if n_det else None),
+        det_parameter_bounds=(CW_BOUNDS if n_det else None),
         gt_psd_val=(jnp.asarray(gtm_psd) if n_gtm else None),
         irn_lower_bound_psd=jnp.array([-20.0, 0.0]),
         irn_upper_bound_psd=jnp.array([-11.0, 7.0]),
@@ -154,12 +173,19 @@ def build(npsr=2, model_string="ltm|unc+cor->unc", linear_timing=True,
                              white_noise_params=wn_vec)
     return Model(psrs, data, wn, rn, helpers, wn_vec, residuals,
                  n_gwb, n_irn, orf_name, include_ecorr,
-                 n_dm, n_gtm, adaptus_basis, gtm_psd)
+                 n_dm, n_gtm, adaptus_basis, gtm_psd, n_det)
 
 
 # --------------------------------------------------------------------------- #
 #  Independent reference ingredients for the same model
 # --------------------------------------------------------------------------- #
+
+def helpers_for(model, residuals):
+    """The same model's helpers on a different residual vector -- used to check
+    a deterministic block against subtracting the same waveform by hand."""
+    return model.rn.get_helpers(reff=jnp.asarray(residuals),
+                                white_noise_params=model.wn_vec)
+
 
 def svd_basis(M):
     """``signals_utils._timing_model_svd``, reimplemented from its docstring."""

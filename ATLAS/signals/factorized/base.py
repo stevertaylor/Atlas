@@ -815,11 +815,22 @@ class SuperSignal:
         self.nmodes = self.get_Fmat_concat.shape[-1]
         self.npsrs = self.data.npsrs
 
+        # Width of the deterministic block, if the model string has one.
+        #
+        # `nmodes` is the FULL basis width. The deterministic columns carry no
+        # prior and are never reparameterised -- their coefficients come from the
+        # deterministic parameters -- so anything sized "one entry per Gaussian
+        # coefficient" (a phi diagonal, a `z` vector) must exclude them. The two
+        # numbers coincide whenever there is no 'det' block, which is why
+        # `self.nmodes` was used for both; see `nmodes_reparam`.
+        self.nmodes_det = (sutils._as_positions(self.signal_comb_idxs['det']).size
+                           if self.has_det else 0)
+
         # get helper arrays for likelihood
         self.get_helpers = self._get_helpers()
 
         # number of frequency bins for NumPyro interface
-        self.nfreqs = int((self.nmodes - self.linear_timing_model_size)/2) # Sine and cosine modes per frequency
+        self.nfreqs = int((self.nmodes - self.nmodes_det - self.linear_timing_model_size)/2) # Sine and cosine modes per frequency
 
         # Hidden attributes if needed-------------------------------------------
         self._diag_idx = jnp.arange(self.nmodes)
@@ -935,6 +946,17 @@ class SuperSignal:
         missing = set(order) - set(signal_map)
         if missing:
             raise ValueError(f"Signals {missing} not found in signal_map")
+
+        # A deterministic block has no `nmodes` and shares its columns with
+        # nothing: it is its own basis. Caught here because the shared-block
+        # branch below reads `signal_map[name].nmodes`, which would otherwise
+        # raise AttributeError several frames from the cause.
+        if 'det' in shared_names:
+            raise ValueError(
+                "'det' is a deterministic block and cannot share a basis with "
+                "stochastic signals; list it separately, e.g. "
+                f"'unc+cor->unc;det' (got {basis_string!r})"
+            )
 
         tm_offset = self.linear_timing_model_size if include_timing else 0
 
@@ -1195,6 +1217,19 @@ class SuperSignal:
         float
             The log-likelihood contribution from the IRN signal. [1]
         """
+        if self.has_det:
+            # Every basis column here is marginalised under a red-noise prior, and
+            # the deterministic columns have neither. The shapes alone would fail
+            # (`phiinv` is the stochastic width, `_diag_idx` the full one), but a
+            # matching-width phiinv would be worse: a silently wrong answer.
+            raise ValueError(
+                "ln_likelihood_curn marginalises every basis column under the red-"
+                "noise prior and carries no deterministic term, but model string "
+                f"{self.signal_combination_string!r} has a 'det' block. Use "
+                "lnposterior_reparam or partial_marg_lnposterior, both of which "
+                "take D_params."
+            )
+
         TNT, TNr, rNr, logdet_N = helpers # Unpack helpers [npsr, nmode, nmode], [npsr, nmode], [0], [0]
 
         phi, psd_common = self.model.get_phi_mat_CURN(params) #[nfreq,npsrs]
@@ -1285,6 +1320,56 @@ class SuperSignal:
         return reparam_idx, det_idx
 
     @cached_property
+    def nmodes_reparam(self):
+        """Width `z` must have in `lnposterior_reparam`.
+
+        `nmodes` is the full basis width; this is the part of it that `z`
+        whitens, i.e. everything except the deterministic block. The two are
+        equal for any model without a 'det' block -- which is why
+        `jnp.zeros((npsr, rn.nmodes))` appears throughout the notebooks and
+        tools and is right there, and wrong the moment a CW is added.
+        """
+        reparam_idx, _ = self.lnposterior_reparam_helper
+        return int(sutils._as_positions(reparam_idx).size)
+
+    @cached_property
+    def nmodes_marg(self):
+        """Width `z` must have in `partial_marg_lnposterior`: the 'cor' block
+        it keeps (2 * num_gwb_bins), everything else being marginalised."""
+        cor_idx = self.signal_comb_idxs.get('cor')
+        return 0 if cor_idx is None else int(sutils._as_positions(cor_idx).size)
+
+    def _check_call_args(self, fname, z, nz_expected, width_attr, D_params):
+        """Argument checks shared by the two reparameterised entry points.
+
+        Each of these otherwise surfaces from inside a jitted function -- as a
+        broadcast error, or `TypeError: cannot unpack non-sequence NoneType` --
+        with the model string that caused it nowhere in the traceback.
+        """
+        if self.has_det and D_params is None:
+            raise ValueError(
+                f"{fname}: model string {self.signal_combination_string!r} has a "
+                "'det' block, so D_params = (det_params, psr_phases, psr_dists) "
+                "is required"
+            )
+        if D_params is not None and not self.has_det:
+            raise ValueError(
+                f"{fname}: D_params was supplied, but model string "
+                f"{self.signal_combination_string!r} has no 'det' block to apply "
+                "it to"
+            )
+        nz = jnp.shape(z)[-1]
+        if nz != nz_expected:
+            hint = ""
+            if self.has_det:
+                hint = (f" -- `nmodes` ({self.nmodes}) counts the "
+                        f"{self.nmodes_det} deterministic columns too; size z "
+                        f"with `{width_attr}`")
+            raise ValueError(
+                f"{fname}: z has width {nz}, expected {nz_expected}{hint}"
+            )
+
+    @cached_property
     def _jitted_lnposterior_reparam(self):
         """Built once per instance and reused — avoids re-tracing on every call."""
         if self.has_det:
@@ -1308,6 +1393,8 @@ class SuperSignal:
                 f"string {self.signal_combination_string!r} has none. Use "
                 "lnposterior_reparam instead."
             )
+        self._check_call_args('partial_marg_lnposterior', z, self.nmodes_marg,
+                              'nmodes_marg', D_params)
         if self.has_det:
             return self._jitted_partial_marg_lnposterior(helpers, red_params, z, D_params)
         else:
@@ -1320,6 +1407,8 @@ class SuperSignal:
         self.has_det is True, in which case D_params = (det_params,
         psr_phases, psr_dists) must be supplied.
         """
+        self._check_call_args('lnposterior_reparam', z, self.nmodes_reparam,
+                              'nmodes_reparam', D_params)
         if self.has_det:
             return self._jitted_lnposterior_reparam(helpers, red_params, z, D_params)
         else:
@@ -1373,7 +1462,12 @@ class SuperSignal:
             phiinvs_diags = phiinvs.diagonal(axis1=-2, axis2=-1)  # [nmodes, npsrs]
 
         if self.linear_timing and not self.marg_tm:
-            phiinvs_diags_ltm = jnp.full(shape=(self.nmodes, self.npsrs),
+            # Width of the REPARAMETERISED block, not `self.nmodes`. With a 'det'
+            # block the two differ by the deterministic columns, and sizing this
+            # by `self.nmodes` made sampled linear timing + a deterministic signal
+            # fail with a raw broadcast error (`[nred, npsr]` into
+            # `[nred + ndet, npsr]`) before any likelihood was evaluated.
+            phiinvs_diags_ltm = jnp.full(shape=(RR.shape[-1], self.npsrs),
                                         fill_value=self.lowest_value_eq_to_zero)
             phiinvs_diags = phiinvs_diags_ltm.at[self.linear_timing_model_size:, :].add(phiinvs_diags)
             # set prior variance of padded parameters to one for stable transformation

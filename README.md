@@ -175,7 +175,7 @@ Nothing downstream of `helpers` touches a TOA.
                         PTA_Data  (data.py)
                        /                   \
        WhiteCov (nMatrix/base.py)       SuperSignal (signals/factorized/base.py)
-       N = EFAC²(σ² + EQUAD²) + ECORR   T = [ M | F_unc | F_dm | U_gtm ]
+       N = EFAC²(σ² + EQUAD²) + ECORR   T = [ M | F_unc | F_dm | U_gtm | F_det ]
        Sherman–Morrison per epoch       column-slice map per signal
                        \                   /
                      helpers = (TNT, TNr, rNr, logdet_N)
@@ -196,13 +196,17 @@ configuration.
 Three entry points consume the helpers:
 
 - `ln_likelihood_curn` marginalises all coefficients with a diagonal `φ`, i.e.
-  the common-uncorrelated-red-noise model. Useful as an exact reference.
+  the common-uncorrelated-red-noise model. Useful as an exact reference. It has
+  no deterministic term and refuses a `det` block.
 - `lnposterior_reparam` samples all coefficients non-centred, with the full
   ORF-correlated `φ`.
 - `partial_marg_lnposterior` marginalises the per-pulsar block analytically
   (timing, intrinsic red noise, DM, Adaptus) and keeps only the background modes
   explicit. On a 67-pulsar configuration this reduces roughly 37,600 latent
   coefficients to about 1,900.
+
+The latter two take an optional `D_params` for a deterministic signal; see
+*Deterministic signals*.
 
 The standardising transform in the latter two is built from the diagonal of
 `φ⁻¹`, so it whitens exactly only when the ORF vanishes; with a non-trivial ORF
@@ -271,6 +275,98 @@ curvature instead of an unbounded flat direction.
 This layout is hardcoded around the five signal names above. Adding a sixth
 requires edits in both `parameterized.py` classes as well as
 `signals/factorized/base.py`; replacing it with a component registry is planned.
+
+## Deterministic signals
+
+A deterministic signal — a continuous wave from an individual supermassive
+black-hole binary, or anything else with a closed-form waveform — enters through
+the same basis as everything else. The waveform is evaluated on an evenly spaced
+grid, Tukey-windowed over a span extended either side of `Tspan` (to keep the
+FFT of a non-periodic signal from ringing), transformed, and the resulting
+Fourier coefficients are mapped onto the observed TOAs by a design matrix
+`F_det` (Gundersen & Cornish 2025). Those columns are the `det` block.
+
+What separates it from a stochastic block is not the basis but the prior: it has
+none. Its coefficients are a deterministic function of the source parameters, so
+they are *computed* from `D_params` rather than sampled, and the source
+parameters are what the sampler explores.
+
+```python
+data = PTA_Data(psrs, num_gwb_bins=14, num_irn_bins=30, num_det_bins=60,
+                marg_timing=True)              # num_det_bins is required by ;det
+...
+rn = m.make_red_noise("unc+cor->unc;det",
+                      irn_psd_function=powerlaw, gwb_psd_function=powerlaw,
+                      orf_function=hd_orf, ...,
+                      det_delay_function=cw_delay_evolve_float64,
+                      det_parameter_bounds=cw_bounds)      # [nparam, 2], min in col 0
+```
+
+`det_delay_function(toas, psr_pos, source_params, psr_phases, psr_dists)` returns
+delays **in seconds**, shape `[npsr, ntoa]`, and must be JAX-traceable and
+differentiable in `source_params`.
+`signals/deterministic/det_signals.py:cw_delay_evolve_float64` is the evolving
+circular-binary waveform including the pulsar term, with `source_params` ordered
+`[log10 M_c, log10 f_gw, cos ι, ψ, log10 h, cos θ, φ, Φ₀]`. A waveform with no
+pulsar term takes `Deterministic(..., with_psr_params=False)`, which is
+constructed directly rather than through `ModelBuilder`, and is then called with
+`psr_phases=None, psr_dists=None`.
+
+Both reparameterised likelihoods take the source parameters as
+`D_params = (det_params, psr_phases, psr_dists)`:
+
+```python
+lnpost, coeff = rn.lnposterior_reparam(helpers, red_params, z, D_params=D)
+lnpost, coeff = rn.partial_marg_lnposterior(helpers, red_params, z_gwb, D_params=D)
+```
+
+`z` is one standard normal per *stochastic* column — `rn.nmodes_reparam`, not
+`rn.nmodes`. `nmodes` is the full width of `T` and counts the deterministic
+columns, which `z` does not touch. The two are equal for every model without a
+`det` block, which is why `jnp.zeros((npsr, rn.nmodes))` appears throughout the
+notebooks and tools; with one it is too wide, and the likelihood says so rather
+than broadcasting.
+
+For `"ltm|unc+cor->unc;det"` with 4 background bins, 6 red-noise bins, 20
+deterministic bins and a 6-column timing block:
+
+```
+    col   0 ..  5    timing    M, zero-padded          ┐
+    col   6 .. 17    unc       F_irn (cor at 6..13)    ┘ z, width nmodes_reparam = 18
+    col  18 .. 57    det       F_det                     a_det(D_params), width 40
+```
+
+`model_maker` drives the stochastic sites only and raises for a `det` block: the
+source parameters need priors it cannot infer — a pulsar-distance prior in
+particular is a per-array input, and `PTA_Data` carries `psr_pos` but no
+distances. Write the model instead, which is the whole of it:
+
+```python
+def model():
+    z   = numpyro.sample('z_a', dist.Normal(0, 1).expand((rn.npsrs, rn.nmodes_reparam)))
+    red = numpyro.sample('red_noise', dist.Uniform(rn.model.lower_prior_lim_all,
+                                                   rn.model.upper_prior_lim_all))
+    cw  = numpyro.sample('cw', dist.Uniform(rn.det_signal.det_param_mins,
+                                            rn.det_signal.det_param_maxs))
+    phases = numpyro.sample('psr_phases',
+                            dist.Uniform(0., 2 * jnp.pi).expand((rn.npsrs,)))
+    dist_z = numpyro.sample('psr_dist_z', dist.Normal().expand((rn.npsrs,)))
+    dists  = numpyro.deterministic('psr_dists', dist_z * pdist_err + pdist_mean)
+
+    lnpost, coeff = rn.lnposterior_reparam(helpers, red, z,
+                                           D_params=(cw, phases, dists))
+    numpyro.factor('lnpost', lnpost + 0.5 * jnp.sum(z ** 2))
+```
+
+The `+ ½ Σz²` is the same cancellation `model_maker` makes: the density returned
+is in the reparameterised coordinate and NumPyro has already added the `N(0,1)`
+prior for `z`.
+
+The identity that pins all of this is that a deterministic block must be exactly
+equivalent to subtracting the same waveform from the data by hand:
+`lnpost(δt, D_params) == lnpost_no_det(δt − F_det a_det)`. `tests/test_identities.py`
+asserts it for both timing treatments, along with the gradient in the source
+parameters against central differences.
 
 ## Timing model
 
@@ -363,10 +459,17 @@ The rows above account for 15,222 lines; the package is 16,853 across 34 modules
 
 ## Known issues
 
-- No end-to-end continuous-wave path currently runs. `JointDeterministic`
-  cannot be constructed, the CW delay function and its caller disagree over
-  whether `tref` has already been subtracted, and `model_maker` does not sample
-  deterministic parameters.
+- `signals/deterministic/base.py:JointDeterministic` is a stranded earlier
+  implementation of the deterministic path and cannot be constructed: it calls
+  `SuperSignal.__init__` with the pre-refactor `signal_helper=` schema and
+  raises `TypeError`. It also subtracts `tref` from its TOA grid before handing
+  it to a delay function that subtracts `tref` again. The live path is the `det`
+  block documented under *Deterministic signals*, which shares none of this
+  code; `notebooks/CW_demo.ipynb` predates it and calls the stranded class.
+- `model_maker` does not sample deterministic parameters — the priors involved
+  are per-array inputs it has no access to — so a `det` block has to be driven
+  from a hand-written NumPyro model. It raises rather than half-sampling.
+  `ln_likelihood_curn` has no deterministic term at all and refuses one too.
 - An `ltm|` prefix is only honoured when the shared group names a representative
   with `->`. Without one, `build_basis` leaves `M` out of the basis while the
   column map still claims it is there, so `"ltm|unc"` and `"ltm|unc;cor"` both

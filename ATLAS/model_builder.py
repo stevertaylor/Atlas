@@ -110,6 +110,19 @@ class ModelBuilder:
                         use_pulsar_tspan = use_pulsar_tspan))
 
         if 'det' in red_signal_names:
+            # Both of these otherwise fail well downstream: a missing
+            # `num_det_bins` as `2 * None` inside the constructor, a missing
+            # delay function only when the likelihood first calls it.
+            if self.data.num_det_bins is None:
+                raise ValueError(
+                    "a 'det' block needs the number of deterministic frequency "
+                    "bins: PTA_Data(..., num_det_bins=N)"
+                )
+            if det_delay_function is None or det_parameter_bounds is None:
+                raise ValueError(
+                    "a 'det' block needs both det_delay_function and "
+                    "det_parameter_bounds"
+                )
             signals.append(Deterministic(name='det',
                          data=self.data,
                          nfreqs_det = self.data.num_det_bins,

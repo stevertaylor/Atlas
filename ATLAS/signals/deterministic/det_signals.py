@@ -83,7 +83,10 @@ def cw_delay_evolve_float64(toas, psr_pos, source_params, psr_phases, psr_dists)
     -------
     res : array
         Array of same shape as 'toas' input. These are the delays in the timing residuals
-        induced by the continuous wave in units of [ns].
+        induced by the continuous wave, in SECONDS -- the same units as the
+        residuals they are subtracted from. (Documented as [ns] until it was
+        measured: the amplitude is h / (2 pi f_gw), ~1e-6 s at log10_h = -13.5,
+        log10_f_gw = -8.4.)
     """
     # unpack parameters
     log10_mc, log10_fgw, cos_inc, psi, log10_h, cos_gwtheta, gwphi, phase0 = source_params

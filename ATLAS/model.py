@@ -61,7 +61,27 @@ def model_maker(raw_residuals,
         ``timing_k`` and forms the residuals from their product. Anything else
         calls ``tm_model.sample_residuals()``, which samples each pulsar's
         physical timing parameters directly from their bounded priors.
+
+    Notes
+    -----
+    This drives the stochastic model only. A ``'det'`` block needs three more
+    sets of sites -- the deterministic parameters, and for a continuous wave a
+    phase and a distance per pulsar -- and the distance prior in particular is a
+    per-array input this function has no access to (``PTA_Data`` carries
+    ``psr_pos`` but no distances). It is rejected here rather than half-sampled:
+    write the NumPyro model yourself and pass ``D_params`` to
+    ``lnposterior_reparam`` / ``partial_marg_lnposterior``. The README's
+    "Deterministic signals" section has the template.
     """
+
+    if getattr(super_sig, 'has_det', False):
+        raise ValueError(
+            "model_maker does not sample deterministic-signal parameters, but "
+            f"model string {super_sig.signal_combination_string!r} has a 'det' "
+            "block. Write the NumPyro model yourself and pass D_params = "
+            "(det_params, psr_phases, psr_dists) to the likelihood -- see the "
+            "'Deterministic signals' section of the README."
+        )
 
     ######################################## Timing Model ########################################
     if tm_model:
@@ -93,10 +113,10 @@ def model_maker(raw_residuals,
                                                   super_sig.model.upper_prior_lim_all))
     # evaluate the posterior
     if marg_over_non_gwb:
-        z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, 2*super_sig.data.num_gwb_bins)))
+        z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, super_sig.nmodes_marg)))
         lprob, coeff = super_sig.partial_marg_lnposterior(helpers = helpers_now, red_params = xs, z = z_a)
     else:
-        z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, super_sig.nmodes)))
+        z_a = numpyro.sample('z_a', dist.Normal(0, 1).expand((super_sig.npsrs, super_sig.nmodes_reparam)))
         lprob, coeff = super_sig.lnposterior_reparam(helpers = helpers_now, red_params = xs, z = z_a)
 
     numpyro.factor('lnpost', lprob + 0.5 * jnp.sum(z_a**2))
